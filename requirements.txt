@@ -1,0 +1,2 @@
+aiohttp==3.11.13
+setuptools==75.8.0
