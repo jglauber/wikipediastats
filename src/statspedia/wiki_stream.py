@@ -79,7 +79,7 @@ class WikiStream():
                             # result = re.sub(r"id:[\s\S]+?]","",result)
 
                             # remove new line separator.
-                            result = re.sub(r"\n","",result)
+                            # result = re.sub(r"\n","",result)
 
                             # remove data property.
                             result = re.sub(r"data: ","",result)
@@ -105,23 +105,37 @@ class WikiStream():
             self._buf.truncate()
         
         if string_buf != "":
-            string_buf = re.sub(r"id: \[[\s\S]+?]","",string_buf)
+            string_buf = re.sub(r"(?<=[\n\n\n])id: \[[\s\S]+?]","",string_buf)
+            string_buf = re.sub(r"\n","",string_buf)
+            index = string_buf.find('{"$schema"')
+            string_buf = string_buf[index:]
             string_buf = string_buf.replace('}{','},{')
             string_buf = fix_comments(string_buf)
             string_buf = re.sub(r"(?<=[^\\])\\(?=[^\\ubfnrt\"\/])",r"\\\\",string_buf)
             string_buf = '[' + string_buf + ']'
             latest_edit_list = []
 
-            try:        
-                latest_edit_list = json.loads(string_buf)
-            except json.JSONDecodeError as e:
-                with open(f"unhandled_decoder_issue_{time.strftime('%Y-%m-%d %H:%M:%S')}.json", 'w') as f:
-                    f.write(e.msg+'\n')
-                    f.write(f"column: {e.colno}"+'\n')
-                    f.write(f"char: {e.pos}"+'\n')
-                    f.write(string_buf)
-                    f.close()
-                latest_edit_list = [] 
+            i = 0
+            while True:
+                try:        
+                    latest_edit_list = json.loads(string_buf)
+                    break
+                except json.JSONDecodeError as e:
+                    if i > 100:
+                        latest_edit_list = []
+                        with open(f"unhandled_decoder_issue_{time.strftime('%Y-%m-%d %H:%M:%S')}.json", 'w') as f:
+                            f.write(e.msg+'\n')
+                            f.write(f"column: {e.colno}"+'\n')
+                            f.write(f"char: {e.pos}"+'\n')
+                            f.write(string_buf)
+                            f.close()
+                        break
+                    
+                    elif e.msg == "Invalid \\escape":
+                        string_buf = string_buf[:e.pos] + string_buf[e.pos+1:]
+                    
+                    i += 1
+
 
             new_list = []
             for item in latest_edit_list:
