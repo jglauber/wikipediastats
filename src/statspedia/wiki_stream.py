@@ -66,24 +66,6 @@ class WikiStream():
                             # clear buffer
                             buffer = b""
 
-                            # remove event, comments, and ascii formatting.
-                            replacements = [('event: message', ''),
-                                            (':ok',''),
-                                            ('‎','')]
-
-
-                            for old, new in replacements:
-                                result = result.replace(old,new)
-                            
-                            # remove message id.
-                            # result = re.sub(r"id:[\s\S]+?]","",result)
-
-                            # remove new line separator.
-                            # result = re.sub(r"\n","",result)
-
-                            # remove data property.
-                            result = re.sub(r"data: ","",result)
-
                             async with self._lock:
                                 self._buf.write(result)
                 except asyncio.TimeoutError:
@@ -105,13 +87,17 @@ class WikiStream():
             self._buf.truncate()
         
         if string_buf != "":
-            string_buf = re.sub(r"(?<=[\n\n\n])id: \[[\s\S]+?]","",string_buf)
+            string_buf = re.sub(r":ok\n\n","", string_buf)
+            string_buf = re.sub(r"event: message", "", string_buf)
+            string_buf = re.sub(r"data: ","",string_buf)
+            string_buf = re.sub(r"(?<=[\n])id: \[[\s\S]+?]","",string_buf)
             string_buf = re.sub(r"\n","",string_buf)
             index = string_buf.find('{"$schema"')
             string_buf = string_buf[index:]
             string_buf = string_buf.replace('}{','},{')
             string_buf = fix_comments(string_buf)
             string_buf = re.sub(r"(?<=[^\\])\\(?=[^\\ubfnrt\"\/])",r"\\\\",string_buf)
+            string_buf = re.sub(r"event: messagedata: ",",",string_buf)
             string_buf = '[' + string_buf + ']'
             latest_edit_list = []
 
@@ -329,7 +315,8 @@ def fix_comments(input_string: str) -> str:
     proper use of quotations
     """
 
-    fixed_string = re.sub(r'(?<="parsedcomment":)[\s\S]+?(?=},{"\$schema")',_replace_quot,input_string)
+    fixed_string = re.sub(r'\u200e','',input_string)
+    fixed_string = re.sub(r'(?<="parsedcomment":)[\s\S]+?(?=},{"\$schema")',_replace_quot,fixed_string)
     fixed_string = re.sub(r'(?<="comment":)[\s\S]+?(?=,"timestamp")',_replace_quot,fixed_string)
     fixed_string = re.sub(r'(?<="log_action_comment":)[\s\S]+?(?=,"server_url")',_replace_quot,fixed_string)
     index = fixed_string.rfind('"parsedcomment":') + 16
