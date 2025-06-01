@@ -13,8 +13,25 @@ from pymongo import AsyncMongoClient
 import copy
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
-from typing import TypeAlias
-import bson
+import logging
+
+# initiate logger
+logger = logging.getLogger(__name__)
+
+# create logs folder
+os.makedirs('logs', exist_ok=True)
+logger.setLevel(logging.DEBUG)
+stream_handler = logging.StreamHandler()
+file_handler = logging.FileHandler('logs/application.log', encoding='utf-8')
+formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+stream_handler.setFormatter(formatter)
+stream_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.DEBUG)
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
+
 
 @dataclass
 class WikiStatistics:
@@ -55,7 +72,7 @@ class WikiStream:
     def __init__(self):
         self.url = "https://stream.wikimedia.org/v2/stream/recentchange"
         self.timeout = 5
-        self.start_time = datetime.now(tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.start_time = datetime.now(tz=timezone.utc)
         self.current_hour = _round_dt_nearest_hour(self.start_time)
         self._buf = io.StringIO()
         self._lock = asyncio.Lock()
@@ -86,13 +103,15 @@ class WikiStream:
                             async with self._lock:
                                 self._buf.write(result)
                 except asyncio.TimeoutError:
-                    print("Timeout Error")
+                    logger.error('Timeout Error')
+                    logger.warning('Restarting Wiki Edit Stream')
                     return await self._wiki_edit_stream()
                 except client_exceptions.ClientPayloadError:
-                    print("Client Payload Error")
+                    logger.error('Client Payload Error')
+                    logger.warning('Restarting Wiki Edit Stream')
                     return await self._wiki_edit_stream()
                 except client_exceptions.ClientConnectorDNSError:
-                    print("Host DNS Server Error")
+                    logger.critical('Host DNS Server Error')
 
     async def _write_buf_to_list(self):
         """
@@ -113,7 +132,7 @@ class WikiStream:
             string_buf = string_buf[index:]
             string_buf = string_buf.replace("}{", "},{")
             string_buf = fix_comments(string_buf)
-            string_buf = re.sub(r"(?<=[^\\])\\(?=[^\\ubfnrt\"\/])", r"\\\\", string_buf)
+            string_buf = re.sub(r"(?<=[^\\])\\(?=[^\\ubfnrt\/])", r"\\\\", string_buf)
             string_buf = re.sub(r"event: messagedata: ", ",", string_buf)
             string_buf = "[" + string_buf + "]"
             latest_edit_list = []
@@ -122,9 +141,12 @@ class WikiStream:
             while True:
                 try:
                     latest_edit_list = json.loads(string_buf)
+                    logger.info('String Buffer Loaded as JSON to Latest Edit List')
                     break
                 except json.JSONDecodeError as e:
+                    logger.warning('JSON Decode Error in Latest Edit List')
                     if i > 100:
+                        logger.error('Unhandled Decoder Issue: %s', e.msg)
                         latest_edit_list = []
                         with open(
                             f"unhandled_decoder_issue_{time.strftime('%Y-%m-%d %H:%M:%S')}.json",
@@ -138,6 +160,9 @@ class WikiStream:
                         break
 
                     elif e.msg == "Invalid \\escape":
+                        if i == 0:
+                            logger.warning("Starting Loop to Remove Invalid Escape Characters")
+                        logger.warning("Attempt %s: %s at %s", i, e.msg, e.pos)
                         string_buf = string_buf[: e.pos] + string_buf[e.pos + 1 :]
 
                     i += 1
@@ -155,10 +180,16 @@ class WikiStream:
 
                         # add bytes change to latest_edit_list dicts
                         item['bytes_change'] = difference
+
+                        # convert dt field to a datetime object
+                        item['meta']['dt'] = datetime.strptime(item['meta']['dt'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+
                         new_list.append(item)
                 except KeyError as e:
-                    print(f"ERROR: Missing Key {e}")
-                    print(json.dumps(item, ensure_ascii=False, indent=4))
+                    if item['meta']['domain'] == 'canary':
+                        logger.warning('Canary Event on Wikistreams')
+                    else:
+                        logger.warning('Item in Latest Edit List Missing Key: %s', e)
 
             latest_edit_list = new_list
 
@@ -168,26 +199,19 @@ class WikiStream:
 
             await self._summarize_stats_hourly()
 
-            if len(self.wiki_edit_list) > 30:
+            wiki_edit_list_count = len(self.wiki_edit_list)
+            if wiki_edit_list_count > 30:
+                logger.debug('Wiki Edit List Count is %s. Clearing and Saving to MongoDB', wiki_edit_list_count)
                 await self.clear_list_and_save()
 
-            editors = Editors(latest_edit_list)
+            debug_list = [
+                ('Program started at: %s', self.start_time),
+                ('Current hour: %s', self.current_hour),
+            ]
 
-            # print status
-            os.system('clear')
-            print(f"""
-Program started at: {self.start_time}
-Current hour: {self.current_hour}
-There are {len(self.wiki_edit_list)} items in the list.
-Editors (human): {editors.total_editors_human()}.
-Editors (bot): {editors.total_editors_bot()}.
-Bytes added: {editors.bytes_added}.
-Bytes removed: {editors.bytes_removed}.
-Top Editors (human): {editors.top_editors_human(10)}
-Top Editors (bot): {editors.top_editors_bot(10)}
-Total Edits: {editors.num_edits}
-""",end='\r')
-                
+            for debug_str, debug_var in debug_list:
+                logger.debug(debug_str,debug_var)
+
 
     async def _loop_buf_to_list(self):
         """
@@ -204,34 +228,37 @@ Total Edits: {editors.num_edits}
         """
 
         count = 0
-        new_current_hour = ''
         for item in self.wiki_edit_list:
             new_current_hour = _round_dt_nearest_hour(item['meta']['dt'])
-            new_ts = _convert_dt_string_to_ts(new_current_hour)
-            old_ts = _convert_dt_string_to_ts(self.current_hour)
-            if new_ts == old_ts:
+            if new_current_hour == self.current_hour:
                 count += 1
 
         if count == 0:
             # ensure data is written to the database
             await self.clear_list_and_save()
-            last_hour_data = self.mongo_collection.find({ 'meta.dt': { '$gte': self.current_hour, '$lt': new_current_hour } })
+            last_hour_data = self.mongo_collection.find({ 'meta.dt': { '$gte': self.current_hour, '$lt': new_current_hour} })
             last_hour_data = await last_hour_data.to_list()
+
+            logger.info('There were %s edits in the last hour.', len(last_hour_data))
                 
             # create a new mongodb collection to store this hour of data.
-            new_collection = self.mongo_db[self.current_hour]
-            await new_collection.insert_many([data for data in last_hour_data])
-            await self.mongo_collection.delete_many({ 'meta.dt': { '$gte': self.current_hour, '$lt': new_current_hour } })
-            
+            # new_collection = self.mongo_db[self.current_hour]
+            # await new_collection.insert_many([data for data in last_hour_data])
+            # logger.debug('Data successfully written to MongoDB')
+            # await self.mongo_collection.delete_many({ 'meta.dt': { '$gte': self.current_hour, '$lt': new_current_hour } })
+            # logger.debug('Data moved from latest_edits collection to %s', self.current_hour)     
             # store hourly stats in mongodb
             wiki_statistics = _create_stats_object(last_hour_data)
+            logger.info('New stats object created for last hour of data')
             total_bytes_change = wiki_statistics.total_bytes_change()
+            logger.info('The total bytes change for the last hour was %s', total_bytes_change)
             stats_dict = asdict(wiki_statistics)
             stats_dict['total_bytes_change'] = total_bytes_change
             stats_dict['timestamp'] = self.current_hour
 
             stats_collection = self.mongo_db['statistics']
             await stats_collection.insert_one(stats_dict)
+            logger.info('Statistics document added to MongoDB for the last hour of data')
 
             # replace current hour with new hour
             self.current_hour = new_current_hour
@@ -248,7 +275,7 @@ Total Edits: {editors.num_edits}
         return data
 
     async def stream(self):
-        start = _convert_dt_string_to_ts(self.start_time)
+        start = self.start_time.timestamp()
         try:
             async with asyncio.TaskGroup() as tg:
                 task1 = tg.create_task(self._wiki_edit_stream())
@@ -260,21 +287,27 @@ Total Edits: {editors.num_edits}
                 task2.cancelled()):
                 await self._write_buf_to_list()
                 await self.clear_list_and_save()
-                print("All tasks cancelled.")
+                logger.info('All tasks cancelled by user')
                 end = datetime.now(tz=timezone.utc).timestamp()
                 total_time = elapsed_time(start, end)
-                print(total_time)
+                logger.info('Total program runtime: %s', total_time)
 
     async def clear_list_and_save(self):
         # write to mongodb
         wiki_edit_list = self.wiki_edit_list
         if len(wiki_edit_list) > 0:
             wiki_edit_list_copy = copy.deepcopy(wiki_edit_list)
-            await self.mongo_collection.insert_many(wiki_edit_list_copy)
+            logger.debug('A new deep copy of Wiki Edit List was created successfully')
+            inserted_ids = 0
+            while inserted_ids == 0:
+                result = await self.mongo_collection.insert_many(wiki_edit_list_copy)
+                inserted_ids = result.inserted_ids
+            logger.info('Wiki Edit List written to latest_edits collection in MongoDB')
 
         async with self._wiki_list_lock:
             # clear the wiki_edit_list
             self.wiki_edit_list.clear()
+            logger.debug('Wiki Edit List succesfully cleared.')
 
 
 def decode(b64_string: str) -> list:
@@ -313,6 +346,7 @@ def fix_comments(input_string: str) -> str:
     """
 
     fixed_string = re.sub(r"\u200e", "", input_string)
+    fixed_string = re.sub(r"\u200f", "", fixed_string)
     fixed_string = re.sub(
         r'(?<="parsedcomment":)[\s\S]+?(?=},{"\$schema")', _replace_quot, fixed_string
     )
@@ -321,6 +355,21 @@ def fix_comments(input_string: str) -> str:
     )
     fixed_string = re.sub(
         r'(?<="log_action_comment":)[\s\S]+?(?=,"server_url")',
+        _replace_quot,
+        fixed_string,
+    )
+    fixed_string = re.sub(
+        r'(?<="title":)[\s\S]+?(?=,"title_url")',
+        _replace_quot,
+        fixed_string,
+    )
+    fixed_string = re.sub(
+        r'(?<="target":)[\s\S]+?(?=,"noredir")',
+        _replace_quot,
+        fixed_string,
+    )
+    fixed_string = re.sub(
+        r'(?<="user":)[\s\S]+?(?=,"bot")',
         _replace_quot,
         fixed_string,
     )
@@ -344,19 +393,19 @@ def _replace_quot(matchobj: Match = None, input_string: str = ""):
     return f'"{text}"'
 
 
-def _convert_dt_string_to_ts(dt: str, format: str = '%Y-%m-%dT%H:%M:%SZ') -> float:
-    new_dt_obj = datetime.strptime(dt, format).replace(tzinfo=timezone.utc)
-    return new_dt_obj.timestamp()
+# def _convert_dt_string_to_dt(dt: str, format: str = '%Y-%m-%dT%H:%M:%SZ') -> datetime:
+#     new_dt_obj = datetime.strptime(dt, format).replace(tzinfo=timezone.utc)
+#     return new_dt_obj
 
-def _round_dt_nearest_hour(dt: str) -> str:
+def _round_dt_nearest_hour(dt: datetime) -> datetime:
     """
-    A function that rounds down a timestamp to nearest hour
+    A function that rounds down a datetime to nearest hour
     """
-    current_hour_ts = _convert_dt_string_to_ts(dt)
+    current_hour_ts = dt.timestamp()
     # remove remainder to round down to nearest hour
     current_hour_rounded = current_hour_ts - (current_hour_ts % 3600)
-    current_hour_rounded_string = datetime.fromtimestamp(current_hour_rounded, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    return current_hour_rounded_string
+    current_hour_rounded_dt = datetime.fromtimestamp(current_hour_rounded, tz=timezone.utc)
+    return current_hour_rounded_dt
 
 # db.latest_changes.find({'meta.dt':{$gte:'2025-05-26T13:00:00Z', $lt:'2025-05-26T14:00:00Z'}}).count()
 
@@ -467,17 +516,3 @@ class Editors:
                     reverse=True,
                 )[0:num_editors]
             )
-
-
-
-
-
-
-
-if __name__ == '__main__':
-    dt = '2025-05-26T23:53:09Z'
-    ts = _convert_dt_string_to_ts(dt)
-    ts = ts - (ts % 3600)
-
-    ts = datetime.fromtimestamp(ts).strftime('%Y-%m-%dT%H:%M:%SZ')
-    print(ts)
