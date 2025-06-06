@@ -2,7 +2,6 @@ import aiohttp
 import asyncio
 from aiohttp import client_exceptions
 import json
-import io
 import time
 import re
 from re import Match
@@ -11,9 +10,10 @@ import base64
 import os
 from pymongo import AsyncMongoClient
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field, asdict
 import logging
+import collections.abc as abc
 
 # initiate logger
 logger = logging.getLogger(__name__)
@@ -42,6 +42,9 @@ class WikiStatistics:
     top_editors_bots: dict = field(default_factory=dict)
     all_editors: dict = field(default_factory=dict)
     all_editors_bots: dict = field(default_factory=dict)
+    top_edited_articles: dict = field(default_factory=dict)
+    all_edited_articles: dict = field(default_factory=dict)
+    num_edited_articles: int = 0
     num_editors: int = 0
     num_editors_bots: int = 0
     num_edits: int = 0
@@ -74,135 +77,164 @@ class WikiStream:
         self.timeout = 5
         self.start_time = datetime.now(tz=timezone.utc)
         self.current_hour = _round_dt_nearest_hour(self.start_time)
-        self._buf = io.StringIO()
-        self._lock = asyncio.Lock()
         self._wiki_list_lock = asyncio.Lock()
+        self._backup_wiki_list_lock = asyncio.Lock()
         self.wiki_edit_list = []
+        self._backup_wiki_edit_list = []
         self.mongo_client = AsyncMongoClient(host="mongodb://127.0.0.1", port=27017)
         self.mongo_db = self.mongo_client.wiki_stream
         self.mongo_collection = self.mongo_db.latest_changes
+        self.server_drop_event = asyncio.Event()
+        self.primary_stream_running = asyncio.Event()
+        self.cancel_secondary_stream = asyncio.Event()
+        self.start_secondary_stream = asyncio.Event()
+        self.secondary_stream_await_timer = asyncio.Event()
+        self.last_item_id = 0
+        self.first_item_id = 0
 
-    async def _wiki_edit_stream(self):
+
+    async def _wiki_edits_generator(self) -> abc.AsyncGenerator[list[dict]]:
         """
-        An async function to stream wikimedia recent changes.
+        A generator function that yields wikipedia edits as a list of dicts.
         """
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(self.url) as response:
+            async with session.request(method='GET', url=self.url, timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=10)) as response:
                 # create a buffer
                 buffer = b""
+                logger.debug(f'HTTP Connection Status Code: {response.status}')
                 try:
                     async for data, end_of_http_chunk in response.content.iter_chunks():
                         buffer += data
                         if end_of_http_chunk:
-                            result = buffer.decode(errors="ignore")
+                            result = buffer.decode(errors="replace")
+                            if result[-1] == '\n':
+                                # if last element is new line character, clear buffer
+                                buffer = b""
+                                result_list = _convert_buffer_to_list(result)
 
-                            # clear buffer
-                            buffer = b""
+                                yield result_list
+                            
+                            else:
+                                logger.debug('HTTP chunk does not contain full object.')
+                                logger.debug('Buffer will be cleared when chunk completes object')
+                                continue
 
-                            async with self._lock:
-                                self._buf.write(result)
-                except asyncio.TimeoutError:
-                    logger.error('Timeout Error')
+                except client_exceptions.ClientPayloadError as e:
+                    logger.error(f'Client Payload Error: {e}')
                     logger.warning('Restarting Wiki Edit Stream')
-                    return await self._wiki_edit_stream()
-                except client_exceptions.ClientPayloadError:
-                    logger.error('Client Payload Error')
-                    logger.warning('Restarting Wiki Edit Stream')
-                    return await self._wiki_edit_stream()
+                    raise
                 except client_exceptions.ClientConnectorDNSError:
                     logger.critical('Host DNS Server Error')
 
-    async def _write_buf_to_list(self):
+
+    async def _primary_stream(self, task: asyncio.Task):
         """
-        Write the buffer io.StringIO to a list.
+        Primary wikipedia edit events stream
         """
-        string_buf = self._buf.getvalue()
-        async with self._lock:
-            self._buf.seek(0)
-            self._buf.truncate()
 
-        if string_buf != "":
-            string_buf = re.sub(r":ok\n\n", "", string_buf)
-            string_buf = re.sub(r"event: message", "", string_buf)
-            string_buf = re.sub(r"data: ", "", string_buf)
-            string_buf = re.sub(r"(?<=[\n])id: \[[\s\S]+?]", "", string_buf)
-            string_buf = re.sub(r"\n", "", string_buf)
-            index = string_buf.find('{"$schema"')
-            string_buf = string_buf[index:]
-            string_buf = string_buf.replace("}{", "},{")
-            string_buf = fix_comments(string_buf)
-            string_buf = re.sub(r"(?<=[^\\])\\(?=[^\\ubfnrt\/])", r"\\\\", string_buf)
-            string_buf = re.sub(r"event: messagedata: ", ",", string_buf)
-            string_buf = "[" + string_buf + "]"
-            latest_edit_list = []
+        start_up_flag = True
+        try:
+            async for latest_edits in self._wiki_edits_generator():
+                if len(latest_edits) > 0:
+                    self.last_item_id = latest_edits[-1]['id']
+                    if start_up_flag:
+                        self.first_item_id = latest_edits[0]['id']
+                        self.server_drop_event.clear()
+                        self.primary_stream_running.set()
+                        self.start_secondary_stream.clear()
+                        if not task.done():
+                            task.cancel()
+                        while True:
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                break
+                        self.secondary_stream_await_timer.set()
+                        task = asyncio.create_task(self._backup_stream())
+                        logger.info("Backup stream reset")
+                        start_up_flag = False
 
-            i = 0
-            while True:
-                try:
-                    latest_edit_list = json.loads(string_buf)
-                    logger.info('String Buffer Loaded as JSON to Latest Edit List')
-                    break
-                except json.JSONDecodeError as e:
-                    logger.warning('JSON Decode Error in Latest Edit List')
-                    if i > 100:
-                        logger.error('Unhandled Decoder Issue: %s', e.msg)
-                        latest_edit_list = []
-                        with open(
-                            f"unhandled_decoder_issue_{time.strftime('%Y-%m-%d %H:%M:%S')}.json",
-                            "w",
-                        ) as f:
-                            f.write(e.msg + "\n")
-                            f.write(f"column: {e.colno}" + "\n")
-                            f.write(f"char: {e.pos}" + "\n")
-                            f.write(string_buf)
-                            f.close()
-                        break
+                    async with self._wiki_list_lock:
+                        self.wiki_edit_list += latest_edits
+                    
+        except client_exceptions.ClientPayloadError:
+            self.primary_stream_running.clear()
+            self.server_drop_event.set()
+            await asyncio.sleep(0.1)
+            return await self._primary_stream(task)
 
-                    elif e.msg == "Invalid \\escape":
-                        if i == 0:
-                            logger.warning("Starting Loop to Remove Invalid Escape Characters")
-                        logger.warning("Attempt %s: %s at %s", i, e.msg, e.pos)
-                        string_buf = string_buf[: e.pos] + string_buf[e.pos + 1 :]
 
-                    i += 1
+    async def _recover_lost_data(self):
+        while True:
+            await self.server_drop_event.wait()
+            logger.info("The server timed out and dropped client.")
 
-            # filter list for edits only.
-            new_list = []
-            for item in latest_edit_list:
-                try:
-                    if (item["type"] == "edit" or item["type"] == "new") and item[
-                        "meta"
-                    ]["domain"] == "en.wikipedia.org":
-                        new = item["length"].get("new", 0)
-                        old = item["length"].get("old", 0)
-                        difference = new - old
+            last_item_id = copy.deepcopy(self.last_item_id)
 
-                        # add bytes change to latest_edit_list dicts
-                        item['bytes_change'] = difference
+            await self.primary_stream_running.wait()
+            logger.info("The connection to server was restored.")
 
-                        # convert dt field to a datetime object
-                        item['meta']['dt'] = datetime.strptime(item['meta']['dt'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            first_item_id = copy.deepcopy(self.first_item_id)
+            
+            logger.debug(f"The last id logged before server issue: {last_item_id}")
+            logger.debug(f"The first id logged after server recovered: {first_item_id}")
 
-                        new_list.append(item)
-                except KeyError as e:
-                    if item['meta']['domain'] == 'canary':
-                        logger.warning('Canary Event on Wikistreams')
-                    else:
-                        logger.warning('Item in Latest Edit List Missing Key: %s', e)
+            temp_missing_items_list = []
+            for _,item in enumerate(self._backup_wiki_edit_list):
+                if item.get('id') > last_item_id and item.get('id') < first_item_id:
+                    temp_missing_items_list.append(item)
+            
+            num_recovered_items = len(temp_missing_items_list)
+            
+            logger.debug(f"There were {num_recovered_items} items recovered.")
 
-            latest_edit_list = new_list
-
-            # update wiki_edit_list
+            # add missing data to wiki_edit_list:
             async with self._wiki_list_lock:
-                self.wiki_edit_list += latest_edit_list
+                self.wiki_edit_list += temp_missing_items_list
 
+            # clear backup list
+            async with self._backup_wiki_list_lock:
+                self._backup_wiki_edit_list.clear()
+        
+
+    async def _schedule_backup_stream(self, timeout: int = 120):
+        while True:
+            await self.secondary_stream_await_timer.wait()
+            logger.debug(f"Scheduling backup stream to start in {timeout} seconds.")
+            await asyncio.sleep(timeout)
+            self.secondary_stream_await_timer.clear()
+            self.start_secondary_stream.set()
+
+
+    async def _backup_stream(self):
+        """
+        A redundant method to gather wikipedia edit events.
+        """
+
+        await self.start_secondary_stream.wait()
+        logger.debug("Backup stream running again.")
+        try:
+            async for latest_edits in self._wiki_edits_generator():
+
+                async with self._backup_wiki_list_lock:
+                    self._backup_wiki_edit_list += latest_edits
+        except client_exceptions.ClientPayloadError:
+            return await self._backup_stream()
+
+
+    async def _write_list_to_db(self):
+        """
+        Write the wiki list to the db.
+        """
+
+        while True:
+            await asyncio.sleep(30)
+            # check if a new hour has arrived
             await self._summarize_stats_hourly()
-
             wiki_edit_list_count = len(self.wiki_edit_list)
-            if wiki_edit_list_count > 30:
-                logger.debug('Wiki Edit List Count is %s. Clearing and Saving to MongoDB', wiki_edit_list_count)
-                await self.clear_list_and_save()
+            logger.debug('Wiki Edit List Count is %s. Clearing and Saving to MongoDB', wiki_edit_list_count)
+            await self.clear_list_and_save()
 
             debug_list = [
                 ('Program started at: %s', self.start_time),
@@ -213,13 +245,17 @@ class WikiStream:
                 logger.debug(debug_str,debug_var)
 
 
-    async def _loop_buf_to_list(self):
-        """
-        A function to manage the loop of writing the buffer to a list
-        """
+    async def _monitor_backup_list_size(self):
         while True:
-            await asyncio.sleep(self.timeout)
-            await self._write_buf_to_list()
+            await asyncio.sleep(30)
+            num_backup_items = len(self._backup_wiki_edit_list)
+            # if primary stream remains stable for a long time,
+            # ensure that backup edit list is cleared periodically.
+            if num_backup_items > 1000:
+                async with self._backup_wiki_list_lock:
+                    self._backup_wiki_edit_list.clear()
+            # print(f"Number of Items in Backup List: {num_backup_items}")        
+
 
     async def _summarize_stats_hourly(self):
         """
@@ -228,25 +264,21 @@ class WikiStream:
         """
 
         count = 0
+        next_hour = self.current_hour + timedelta(hours=1)
         for item in self.wiki_edit_list:
-            new_current_hour = _round_dt_nearest_hour(item['meta']['dt'])
-            if new_current_hour == self.current_hour:
+            if next_hour != _round_dt_nearest_hour(item['meta']['dt']):
                 count += 1
+                break
 
-        if count == 0:
+        if len(self.wiki_edit_list) > 0 and count == 0:
+            logger.info('All Items in Wiki Edit List have shifted to new hour.')
             # ensure data is written to the database
             await self.clear_list_and_save()
-            last_hour_data = self.mongo_collection.find({ 'meta.dt': { '$gte': self.current_hour, '$lt': new_current_hour} })
+            last_hour_data = self.mongo_collection.find({ 'meta.dt': { '$gte': self.current_hour, '$lt': next_hour} })
             last_hour_data = await last_hour_data.to_list()
 
             logger.info('There were %s edits in the last hour.', len(last_hour_data))
-                
-            # create a new mongodb collection to store this hour of data.
-            # new_collection = self.mongo_db[self.current_hour]
-            # await new_collection.insert_many([data for data in last_hour_data])
-            # logger.debug('Data successfully written to MongoDB')
-            # await self.mongo_collection.delete_many({ 'meta.dt': { '$gte': self.current_hour, '$lt': new_current_hour } })
-            # logger.debug('Data moved from latest_edits collection to %s', self.current_hour)     
+                    
             # store hourly stats in mongodb
             wiki_statistics = _create_stats_object(last_hour_data)
             logger.info('New stats object created for last hour of data')
@@ -260,8 +292,8 @@ class WikiStream:
             await stats_collection.insert_one(stats_dict)
             logger.info('Statistics document added to MongoDB for the last hour of data')
 
-            # replace current hour with new hour
-            self.current_hour = new_current_hour
+            # replace current hour with next hour
+            self.current_hour = next_hour
 
 
     def encode(self) -> str:
@@ -276,21 +308,31 @@ class WikiStream:
 
     async def stream(self):
         start = self.start_time.timestamp()
+        task5 = asyncio.create_task(self._backup_stream())
+        
         try:
             async with asyncio.TaskGroup() as tg:
-                task1 = tg.create_task(self._wiki_edit_stream())
-                task2 = tg.create_task(self._loop_buf_to_list())
-                # task3 = tg.create_task(self._summarize_stats_hourly())
-                # task3 = tg.create_task(self._check_list_size_bytes())
+                task1 = tg.create_task(self._primary_stream(task5))
+                task2 = tg.create_task(self._recover_lost_data())
+                task3 = tg.create_task(self._write_list_to_db())
+                task4 = tg.create_task(self._schedule_backup_stream())
+                task6 = tg.create_task(self._monitor_backup_list_size())
+
         except asyncio.CancelledError:
-            if (task1.cancelled() and
-                task2.cancelled()):
-                await self._write_buf_to_list()
-                await self.clear_list_and_save()
-                logger.info('All tasks cancelled by user')
-                end = datetime.now(tz=timezone.utc).timestamp()
-                total_time = elapsed_time(start, end)
-                logger.info('Total program runtime: %s', total_time)
+            while True:
+                if (task1.cancelled() and
+                    task2.cancelled() and
+                    task3.cancelled() and
+                    task4.cancelled() and
+                    task5.cancelled() and
+                    task6.cancelled()):
+                    # await self._write_buf_to_list()
+                    # await self.clear_list_and_save()
+                    logger.info('All tasks cancelled by user')
+                    end = datetime.now(tz=timezone.utc).timestamp()
+                    total_time = elapsed_time(start, end)
+                    logger.info('Total program runtime: %s', total_time)
+                    break
 
     async def clear_list_and_save(self):
         # write to mongodb
@@ -308,6 +350,103 @@ class WikiStream:
             # clear the wiki_edit_list
             self.wiki_edit_list.clear()
             logger.debug('Wiki Edit List succesfully cleared.')
+
+
+def _convert_buffer_to_list(string_buf) -> list:
+    """
+    Convert the buffer to a python list.
+    """
+
+    # remove new line separators
+    string_buf = re.sub(r"\n", "", string_buf)
+
+    # remove ok comment
+    string_buf = re.sub(r":ok", "", string_buf)
+
+    # remove event: message line
+    string_buf = re.sub(r"event: message", "", string_buf)
+
+    # remove id category
+    string_buf = re.sub(r"id: \[[\s\S]+?]", "", string_buf)
+
+    # remove data string to expose underlying object
+    string_buf = re.sub(r"data: ", "", string_buf)
+    
+    # add commas to separate multiple entries
+    index = string_buf.find('{"$schema"')
+    if index > -1:
+        string_buf = string_buf[index:]
+        string_buf = string_buf.replace("}{", "},{")
+
+    # fix issues with double vs. single quotes
+    string_buf = fix_comments(string_buf)
+
+    # ensure backslashes are properly escaped
+    string_buf = re.sub(r"(?<=[^\\])\\(?=[^\\ubfnrt\/])", r"\\\\", string_buf)
+    string_buf = re.sub(r"event: messagedata: ", ",", string_buf)
+
+    # add list brackets
+    string_buf = "[" + string_buf + "]"
+
+    latest_edit_list = []
+
+    if string_buf == "[]":
+        return latest_edit_list
+
+    i = 0
+    while True:
+        try:
+            latest_edit_list = json.loads(string_buf)
+            break
+        except json.JSONDecodeError as e:
+            logger.warning('JSON Decode Error in Latest Edit List')
+            if i > 100:
+                logger.error('Unhandled Decoder Issue: %s', e.msg)
+                latest_edit_list = []
+                with open(
+                    f"unhandled_decoder_issue_{time.strftime('%Y-%m-%d %H:%M:%S')}.json",
+                    "w",
+                ) as f:
+                    f.write(e.msg + "\n")
+                    f.write(f"column: {e.colno}" + "\n")
+                    f.write(f"char: {e.pos}" + "\n")
+                    f.write(string_buf)
+                    f.close()
+                break
+
+            elif e.msg == "Invalid \\escape":
+                if i == 0:
+                    logger.warning("Starting Loop to Remove Invalid Escape Characters")
+                logger.warning("Attempt %s: %s at %s", i, e.msg, e.pos)
+                string_buf = string_buf[: e.pos] + string_buf[e.pos + 1 :]
+
+            i += 1
+
+    # filter list for edits only.
+    new_list = []
+    for item in latest_edit_list:
+        try:
+            if (item["type"] == "edit" or item["type"] == "new") and item[
+                "meta"
+            ]["domain"] == "en.wikipedia.org":
+                new = item["length"].get("new", 0)
+                old = item["length"].get("old", 0)
+                difference = new - old
+
+                # add bytes change to latest_edit_list dicts
+                item['bytes_change'] = difference
+
+                # convert dt field to a datetime object
+                item['meta']['dt'] = datetime.strptime(item['meta']['dt'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+
+                new_list.append(item)
+        except KeyError as e:
+            if item['meta']['domain'] == 'canary':
+                logger.warning('Canary Event on Wikistreams')
+            else:
+                logger.warning('Item in Latest Edit List Missing Key: %s', e)
+
+    return new_list
 
 
 def decode(b64_string: str) -> list:
@@ -374,9 +513,10 @@ def fix_comments(input_string: str) -> str:
         fixed_string,
     )
     index = fixed_string.rfind('"parsedcomment":') + 16
-    fixed_string = (
-        fixed_string[:index] + _replace_quot(input_string=fixed_string[index:-1]) + "}"
-    )
+    if index > 15:
+        fixed_string = (
+            fixed_string[:index] + _replace_quot(input_string=fixed_string[index:-1]) + "}"
+        )
     return fixed_string
 
 
@@ -428,6 +568,9 @@ def _create_stats_object(mongodb_data: list) -> WikiStatistics:
     wiki_statistics.bytes_removed = editors.bytes_removed
     wiki_statistics.all_editors = editors.human
     wiki_statistics.all_editors_bots = editors.bot
+    wiki_statistics.top_edited_articles = editors.top_edited_articles(100)
+    wiki_statistics.all_edited_articles = editors.edits_by_title
+    wiki_statistics.num_edited_articles = editors.total_docs_edited()
 
     return wiki_statistics
     
@@ -444,15 +587,28 @@ class Editors:
         self.num_edits = len(all_edits)
         self.bytes_added = 0
         self.bytes_removed = 0
+        self.edits_by_title = {}
         if self.num_edits > 0:
             for item in all_edits:
                 user = item.get("user")
                 bot = item.get("bot", False)
+                title = item.get("title")
+
+                # collate edits for each article title
+
+                if title in self.edits_by_title.keys():
+                    self.edits_by_title[title] += 1
+                else:
+                    self.edits_by_title[title] = 1
+
+                # collate edits by humans
                 if not bot:
                     if user in self.human.keys():
                         self.human[user] += 1
                     else:
                         self.human[user] = 1
+                
+                # collate edits by bots
                 if bot:
                     if user in self.bot.keys():
                         self.bot[user] += 1
@@ -480,6 +636,9 @@ class Editors:
 
     def total_editors_bot(self) -> int:
         return len(self.bot.keys())
+    
+    def total_docs_edited(self) -> int:
+        return len(self.edits_by_title.keys())
     
     def top_editors_human(self, num_editors: int) -> dict:
         if len(self.human.items()) < num_editors:
@@ -515,4 +674,22 @@ class Editors:
                     key=lambda item: item[1],
                     reverse=True,
                 )[0:num_editors]
+            )
+    
+    def top_edited_articles(self, num_articles: int) -> dict:
+        if len(self.edits_by_title.items()) < num_articles:
+            return dict(
+                sorted(
+                    self.edits_by_title.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            )
+        else:
+            return dict(
+                sorted(
+                    self.edits_by_title.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[0:num_articles]
             )
