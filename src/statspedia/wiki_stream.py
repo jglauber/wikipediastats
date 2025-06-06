@@ -251,7 +251,7 @@ class WikiStream:
             num_backup_items = len(self._backup_wiki_edit_list)
             # if primary stream remains stable for a long time,
             # ensure that backup edit list is cleared periodically.
-            if num_backup_items > 1000:
+            if num_backup_items > 5000:
                 async with self._backup_wiki_list_lock:
                     self._backup_wiki_edit_list.clear()
             # print(f"Number of Items in Backup List: {num_backup_items}")        
