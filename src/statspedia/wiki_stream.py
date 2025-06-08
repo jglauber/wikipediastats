@@ -98,7 +98,7 @@ class WikiStream:
         A generator function that yields wikipedia edits as a list of dicts.
         """
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(raise_for_status=True) as session:
             async with session.request(method='GET', url=self.url, timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=10)) as response:
                 # create a buffer
                 buffer = b""
@@ -159,9 +159,13 @@ class WikiStream:
                         self.wiki_edit_list += latest_edits
                     
         except client_exceptions.ClientPayloadError:
+            logger.info("Primary stream dropped by server.")
             self.primary_stream_running.clear()
             self.server_drop_event.set()
-            await asyncio.sleep(0.1)
+            return await self._primary_stream(task)
+        
+        except client_exceptions.ClientResponseError as e:
+            logger.info(f"Primary stream encountered client response error: {e}")
             return await self._primary_stream(task)
 
 
@@ -216,10 +220,13 @@ class WikiStream:
         logger.debug("Backup stream running again.")
         try:
             async for latest_edits in self._wiki_edits_generator():
-
                 async with self._backup_wiki_list_lock:
                     self._backup_wiki_edit_list += latest_edits
         except client_exceptions.ClientPayloadError:
+            logger.info("Backup stream dropped by server.")
+            return await self._backup_stream()
+        except client_exceptions.ClientResponseError as e:
+            logger.info(f"Backup stream encountered client response error: {e}")
             return await self._backup_stream()
 
 
