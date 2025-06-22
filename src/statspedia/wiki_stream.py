@@ -14,6 +14,10 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field, asdict
 import logging
 import collections.abc as abc
+from .errors import (
+    PrimaryStreamError,
+    BackupStreamError
+    )
 
 # initiate logger
 logger = logging.getLogger(__name__)
@@ -91,6 +95,7 @@ class WikiStream:
         self.secondary_stream_await_timer = asyncio.Event()
         self.last_item_id = 0
         self.first_item_id = 0
+        self._backup_stream_task = asyncio.create_task(self._backup_stream())
 
 
     async def _wiki_edits_generator(self) -> abc.AsyncGenerator[list[dict]]:
@@ -124,8 +129,36 @@ class WikiStream:
                     logger.error(f'Client Payload Error: {e}')
                     logger.warning('Restarting Wiki Edit Stream')
                     raise
+                except client_exceptions.SocketTimeoutError as e:
+                    logger.critical(f'Socket Timeout Error: {e}')
+                    logger.warning('Restarting Wiki Edit Stream')
+                    raise
                 except client_exceptions.ClientConnectorDNSError:
                     logger.critical('Host DNS Server Error')
+
+
+    async def _primary_stream_handler(self):
+        """
+        Handle the primary stream and
+        cancel and restart when errors occur.
+        """
+
+        while True:
+            try:
+                task1 = asyncio.create_task(self._primary_stream(self._backup_stream_task))
+                await task1
+            
+            except PrimaryStreamError:
+                if not task1.done():
+                    task1.cancel()
+                while True:
+                    try:
+                        await task1
+                    except PrimaryStreamError:
+                        continue
+                    except asyncio.CancelledError:
+                        break
+                continue
 
 
     async def _primary_stream(self, task: asyncio.Task):
@@ -152,6 +185,7 @@ class WikiStream:
                                 break
                         self.secondary_stream_await_timer.set()
                         task = asyncio.create_task(self._backup_stream())
+                        self._backup_stream_task = task
                         logger.info("Backup stream reset")
                         start_up_flag = False
 
@@ -159,15 +193,35 @@ class WikiStream:
                         self.wiki_edit_list += latest_edits
                     
         except client_exceptions.ClientPayloadError:
-            logger.info("Primary stream dropped by server.")
+            msg = "Primary stream dropped by server."
+            logger.info(msg)
             self.primary_stream_running.clear()
             self.server_drop_event.set()
-            return await self._primary_stream(task)
+            raise PrimaryStreamError(msg)
         
-        except client_exceptions.ClientResponseError as e:
-            logger.info(f"Primary stream encountered client response error: {e}")
-            return await self._primary_stream(task)
+        except client_exceptions.SocketTimeoutError:
+            msg = "Primary stream socket timeout error."
+            logger.info(msg)
+            self.primary_stream_running.clear()
+            self.server_drop_event.set()
+            raise PrimaryStreamError(msg)
 
+        except client_exceptions.ClientResponseError as e:
+            msg = f"Primary stream encountered client response error: {e}"
+            logger.info(msg)
+            self.primary_stream_running.clear()
+            self.server_drop_event.set()
+            raise PrimaryStreamError(msg)
+
+        except BackupStreamError:
+            if not task.done():
+                task.cancel()
+            while True:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    break
+            
 
     async def _recover_lost_data(self):
         while True:
@@ -216,18 +270,25 @@ class WikiStream:
         A redundant method to gather wikipedia edit events.
         """
 
-        await self.start_secondary_stream.wait()
-        logger.debug("Backup stream running again.")
-        try:
-            async for latest_edits in self._wiki_edits_generator():
-                async with self._backup_wiki_list_lock:
-                    self._backup_wiki_edit_list += latest_edits
-        except client_exceptions.ClientPayloadError:
-            logger.info("Backup stream dropped by server.")
-            return await self._backup_stream()
-        except client_exceptions.ClientResponseError as e:
-            logger.info(f"Backup stream encountered client response error: {e}")
-            return await self._backup_stream()
+        while True:
+            await self.start_secondary_stream.wait()
+            logger.debug("Backup stream running again.")
+            try:
+                async for latest_edits in self._wiki_edits_generator():
+                    async with self._backup_wiki_list_lock:
+                        self._backup_wiki_edit_list += latest_edits
+            except client_exceptions.ClientPayloadError:
+                msg = "Backup stream dropped by server."
+                logger.info(msg)
+                continue
+            except client_exceptions.ClientResponseError as e:
+                msg = f"Backup stream encountered client response error: {e}"
+                logger.info(msg)
+                continue
+            except client_exceptions.SocketTimeoutError as e:
+                msg = f"Backup stream socket timeout error: {e}"
+                logger.info(msg)
+                continue
 
 
     async def _write_list_to_db(self):
@@ -315,15 +376,13 @@ class WikiStream:
 
     async def stream(self):
         start = self.start_time.timestamp()
-        task5 = asyncio.create_task(self._backup_stream())
-        
         try:
             async with asyncio.TaskGroup() as tg:
-                task1 = tg.create_task(self._primary_stream(task5))
+                task1 = tg.create_task(self._primary_stream_handler())
                 task2 = tg.create_task(self._recover_lost_data())
                 task3 = tg.create_task(self._write_list_to_db())
                 task4 = tg.create_task(self._schedule_backup_stream())
-                task6 = tg.create_task(self._monitor_backup_list_size())
+                task5 = tg.create_task(self._monitor_backup_list_size())
 
         except asyncio.CancelledError:
             while True:
@@ -331,8 +390,7 @@ class WikiStream:
                     task2.cancelled() and
                     task3.cancelled() and
                     task4.cancelled() and
-                    task5.cancelled() and
-                    task6.cancelled()):
+                    task5.cancelled()):
                     # await self._write_buf_to_list()
                     # await self.clear_list_and_save()
                     logger.info('All tasks cancelled by user')
