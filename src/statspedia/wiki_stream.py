@@ -149,15 +149,6 @@ class WikiStream:
                 await task1
             
             except PrimaryStreamError:
-                if not task1.done():
-                    task1.cancel()
-                while True:
-                    try:
-                        await task1
-                    except PrimaryStreamError:
-                        continue
-                    except asyncio.CancelledError:
-                        break
                 continue
 
 
@@ -212,15 +203,6 @@ class WikiStream:
             self.primary_stream_running.clear()
             self.server_drop_event.set()
             raise PrimaryStreamError(msg)
-
-        except BackupStreamError:
-            if not task.done():
-                task.cancel()
-            while True:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    break
             
 
     async def _recover_lost_data(self):
